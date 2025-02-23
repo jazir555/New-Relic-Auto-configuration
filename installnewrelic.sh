@@ -8,8 +8,23 @@ NEWRELIC_LICENSE_KEY="YOUR_LICENSE_KEY"
 
 # Configuration
 REQUIRED_SPACE=100000  # 100MB in KB
+REQUIRED_MEMORY=524288  # 512MB in KB
 CURL_TIMEOUT=30
 LOG_FILE="/var/log/newrelic-install.log"
+GPG_KEY_FINGERPRINT="A758B3FBCD43BE8D123A3476BB29EE038ECCE87C"
+
+# Create log directory if it doesn't exist
+if [ ! -d "$(dirname "$LOG_FILE")" ]; then
+    mkdir -p "$(dirname "$LOG_FILE")"
+fi
+
+# Support for proxy environments
+if [ -n "$http_proxy" ] || [ -n "$https_proxy" ]; then
+    export HTTPS_PROXY="$https_proxy"
+    export HTTP_PROXY="$http_proxy"
+    export http_proxy="$http_proxy"
+    export https_proxy="$https_proxy"
+fi
 
 # Function to log messages
 log_message() {
@@ -26,9 +41,16 @@ cleanup() {
             log_message "Restoring backup configuration..."
             mv /etc/newrelic-infra.yml.backup /etc/newrelic-infra.yml
         fi
+        # Clean up temporary files
+        rm -f /etc/apt/sources.list.d/newrelic-infra.list 2>/dev/null || true
+        rm -f /etc/yum.repos.d/newrelic-infra.repo 2>/dev/null || true
+        rm -f /etc/apt/trusted.gpg.d/newrelic-infra.gpg 2>/dev/null || true
     fi
     exit $exit_code
 }
+
+# Handle interrupts
+trap 'log_message "Installation interrupted"; exit 1' INT
 trap cleanup EXIT
 
 # Check if script is run as root
@@ -45,13 +67,23 @@ fi
 
 # Check for required commands
 check_requirements() {
-    local cmds=("curl" "systemctl" "grep" "awk" "gpg")
+    local cmds=("curl" "systemctl" "grep" "awk" "gpg" "lsb_release")
     for cmd in "${cmds[@]}"; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             log_message "ERROR: Required command '$cmd' not found"
             exit 1
         fi
     done
+}
+
+# Check system requirements
+check_system_requirements() {
+    # Check memory
+    local available_memory=$(free -k | awk '/^Mem:/ {print $2}')
+    if [ "$available_memory" -lt "$REQUIRED_MEMORY" ]; then
+        log_message "ERROR: Insufficient memory. Required: ${REQUIRED_MEMORY}KB, Available: ${available_memory}KB"
+        exit 1
+    fi
 }
 
 # Check disk space
@@ -86,6 +118,15 @@ detect_os() {
         . /etc/os-release
         OS=$ID
         VERSION_ID=$VERSION_ID
+        
+        # Handle systems with multiple package managers
+        if command -v apt-get >/dev/null 2>&1 && command -v yum >/dev/null 2>&1; then
+            if [ -f /etc/debian_version ]; then
+                OS="debian"
+            elif [ -f /etc/redhat-release ]; then
+                OS="rhel"
+            fi
+        fi
     else
         log_message "ERROR: OS not supported"
         exit 1
@@ -110,12 +151,12 @@ install_dependencies() {
             log_message "ERROR: Failed to update package lists"
             exit 1
         fi
-        if ! apt-get install -y curl systemd gpg; then
+        if ! apt-get install -y curl systemd gpg lsb-release; then
             log_message "ERROR: Failed to install dependencies"
             exit 1
         fi
     elif [[ "$OS" == "centos" || "$OS" == "fedora" || "$OS" == "rhel" ]]; then
-        if ! yum install -y curl systemd; then
+        if ! yum install -y curl systemd redhat-lsb-core; then
             log_message "ERROR: Failed to install dependencies"
             exit 1
         fi
@@ -134,6 +175,13 @@ install_newrelic_infra() {
         # Add GPG key (modern method)
         curl -s https://download.newrelic.com/infrastructure_agent/gpg/newrelic-infra.gpg | \
             gpg --dearmor | tee /etc/apt/trusted.gpg.d/newrelic-infra.gpg > /dev/null
+            
+        # Verify GPG key fingerprint
+        local actual_fingerprint=$(gpg --show-keys /etc/apt/trusted.gpg.d/newrelic-infra.gpg 2>/dev/null | grep -A1 "pub" | tail -n1 | tr -d ' ')
+        if [ "$actual_fingerprint" != "$GPG_KEY_FINGERPRINT" ]; then
+            log_message "ERROR: GPG key fingerprint verification failed"
+            exit 1
+        fi
         
         if ! apt-get update; then
             log_message "ERROR: Failed to update package lists after adding repository"
@@ -147,6 +195,14 @@ install_newrelic_infra() {
         local major_version=${VERSION_ID%%.*}
         curl --max-time "$CURL_TIMEOUT" -o /etc/yum.repos.d/newrelic-infra.repo \
             https://download.newrelic.com/infrastructure_agent/linux/yum/el/${major_version}/x86_64/newrelic-infra.repo
+            
+        # Handle SELinux if enabled
+        if command -v selinuxenabled >/dev/null 2>&1; then
+            if selinuxenabled; then
+                semanage port -a -t http_port_t -p tcp 443 || true
+            fi
+        fi
+        
         if ! yum install newrelic-infra -y; then
             log_message "ERROR: Failed to install New Relic Infrastructure Agent"
             exit 1
@@ -171,7 +227,6 @@ configure_newrelic_infra() {
     # Create new configuration
     cat > /etc/newrelic-infra.yml << EOF
 license_key: ${NEWRELIC_LICENSE_KEY}
-# Add any additional configuration options here
 display_name: $(hostname)
 custom_attributes:
   environment: production
@@ -200,12 +255,12 @@ validate_config() {
 start_newrelic_infra() {
     log_message "Starting New Relic Infrastructure Agent..."
     systemctl daemon-reload
-    if ! systemctl start newrelic-infra; then
-        log_message "ERROR: Failed to start New Relic Infrastructure Agent"
+    if ! timeout 30 systemctl start newrelic-infra; then
+        log_message "ERROR: Failed to start New Relic Infrastructure Agent (timeout)"
         exit 1
     fi
-    if ! systemctl enable newrelic-infra; then
-        log_message "ERROR: Failed to enable New Relic Infrastructure Agent"
+    if ! timeout 30 systemctl enable newrelic-infra; then
+        log_message "ERROR: Failed to enable New Relic Infrastructure Agent (timeout)"
         exit 1
     fi
     check_status "Agent startup"
@@ -252,6 +307,7 @@ log_message "Starting New Relic Infrastructure Agent installation"
 
 # Pre-installation checks
 check_requirements
+check_system_requirements
 check_disk_space
 check_network
 check_systemd
